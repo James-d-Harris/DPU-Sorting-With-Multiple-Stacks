@@ -2,15 +2,25 @@
 #include <dpu_log.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stding.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
 #include <string.h>
 #include <assert.h>
 #include <omp.h>
 
+#ifndef NR_DPUS
+#define NR_DPUS 2546
+#endif
+#ifndef NR_TASKLETS
+#define NR_TASKLETS 16
+#endif
 #ifndef MAX_ELEMS_PER_DPU
 #define MAX_ELEMS_PER_DPU 16000
+#endif
+
+#ifndef DPU_EXE
+#define DPU_EXE "./quicksort_dpu"
 #endif
 
 // Must be a factor of 40, with a maximum of 40 (# ranks)
@@ -32,12 +42,14 @@ static inline uint64_t ns_diff(const struct timespec a, const struct timespec b)
 }
 
 
-void dpu_sort(input, num_elems, set_num) {
+int dpu_sort(uint32_t *input, uint32_t num_elems, uint32_t set_num) {
+    struct timespec t_h2d_s, t_h2d_e, t_exec_s, t_exec_e, t_d2h_s, t_d2h_e;
+    clock_gettime(CLOCK_MONOTONIC, &t_exec_s);
     struct dpu_set_t set, dpu;
 
-    dpu_erro_t err = dpu_alloc_ranks(TOTAL_RANKS / NUM_SETS, NULL, &set);
+    dpu_error_t err = dpu_alloc_ranks(TOTAL_RANKS / NUM_SETS, NULL, &set);
     if(err != DPU_OK) {
-        fprintf(stderr, "alloc_ranks failed: %S\n", dpu_error_to_string(err));
+        fprintf(stderr, "alloc_ranks failed: %s\n", dpu_error_to_string(err));
         return 1;
     }
 
@@ -47,16 +59,44 @@ void dpu_sort(input, num_elems, set_num) {
         fprintf(stderr, "No DPUs allocated.\n");
         return 1;
     }
-    fprintf("%d DPUs allocated for DPU set %d.\n", num_dpu, set_num);
+    printf("%u DPUs allocated for DPU set %u.\n", num_dpu, set_num);
 
-    DPU_ASSERT(dpu_load(q_set, DPU_EXE, NULL));
+    DPU_ASSERT(dpu_load(set, DPU_EXE, NULL));
 
-    struct timespec t_h2d_s, t_h2d_e, t_exec_e, t_d2h_e, t_merge_e;
+    clock_gettime(CLOCK_MONOTONIC, &t_h2d_s);
 
-    clock_gettime(CLOCK_MONOTONIC, t_h2d_s);
+    uint32_t idx = 0;
+    DPU_FOREACH(set, dpu) {
+        if (idx >= num_dpu) break;
+
+        idx++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t_h2d_e);
+
+
+
+    clock_gettime(CLOCK_MONOTONIC, &t_d2h_s);
+
+    idx = 0;
+    DPU_FOREACH(set, dpu) {
+        if (idx >= num_dpu) break;
+
+        idx++;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t_d2h_e);
+
+    clock_gettime(CLOCK_MONOTONIC, &t_exec_e);
+
+    return 0;
 }
 
 int main(int argc, char **argv) {
+
+    if (TOTAL_RANKS % NUM_SETS != 0) {
+        fprintf(stderr, "%d sets is not a factor of %d ranks!\n\n", NUM_SETS, TOTAL_RANKS);
+        return 1;
+    }
+
     // Total number of elems 
     uint32_t N = (argc >= 2) ? (uint32_t)strtoul(argv[1], NULL, 10) : (1u << 20);
     // number of DPUs to be used. Not really utilized outside of shards
@@ -96,8 +136,12 @@ int main(int argc, char **argv) {
     #pragma omp parallel for 
     for (uint32_t i = 0; i < NUM_SETS; i++) {
         // Split input depending on set size
-        uint32_t offset = i * (N / NUM_SETS)
-        dpu_sort(&input[offset], offset, i);
+        uint32_t offset = i * (N / NUM_SETS);
+        int err = dpu_sort(&input[offset], offset, i);
+
+        if (err > 0) {
+            printf("SET #%u encounterd and error", i);
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t_all_sets_e);
@@ -107,11 +151,16 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t_completed);
 
     uint64_t ns_total_time = ns_diff(t_after_rand, t_completed);
-    uint64_t ns_longest_set = ns_diff(t_all_sets_s, t_all_sets_e);
+    uint64_t ns_all_sets = ns_diff(t_all_sets_s, t_all_sets_e);
+
+
+    printf("\n--- DPU Timing (ms) ---\n");
+    printf("Total Execute Time.  : %.3f\n", ns_total_time / 1e6);
+    printf("Longest Set Time.    : %.3f\n", ns_all_sets / 1e6);
 
 
     free(input);
-    
+
     free(shard_starts);
-    free(shart_counts);
+    free(shard_counts);
 }
