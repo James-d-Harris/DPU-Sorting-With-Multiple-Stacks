@@ -26,7 +26,6 @@
 // Must be a factor of 40, with a maximum of 40 (# ranks)
 #ifndef NUM_SETS
 #define NUM_SETS 2
-
 #endif
 
 #ifndef TOTAL_RANKS
