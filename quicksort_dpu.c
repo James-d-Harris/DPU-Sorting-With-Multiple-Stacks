@@ -18,8 +18,9 @@
 struct dpu_stats {
     uint32_t n_elems;
     uint32_t nr_tasklets;
-    uint32_t cycles_sort;    // cycles in quicksort region (tasklet 0)
-    uint32_t cycles_total;   // cycles since perfcounter_config (tasklet 0)
+    uint32_t cycles_sort;     // duration of sort region
+    uint32_t cycles_total;    // timestamp at end (since perfcounter_config)
+    uint32_t cycles_start;    // timestamp at start of sort region
 };
 __host struct dpu_stats STATS;
 
@@ -32,16 +33,11 @@ typedef struct __attribute__((packed, aligned(8))) {
 } elem_t;
 
 #ifndef MAX_ELEMS_PER_DPU
-#define MAX_ELEMS_PER_DPU (1u << 20)
+#define MAX_ELEMS_PER_DPU 16384
 #endif
 
 __mram_noinit elem_t MRAM_ARR[MAX_ELEMS_PER_DPU];
 
-// ---------- Host-provided arguments ----------
-struct dpu_args {
-    uint32_t n_elems;   // how many valid elems in MRAM_ARR
-};
-__host struct dpu_args ARGS;
 
 // ---------- MRAM helpers (8B aligned) ----------
 static inline void mram_read_elem(uint32_t idx, elem_t *dst) {
@@ -131,7 +127,7 @@ int main() {
     }
     barrier_wait(&sync_barrier);
 
-    uint32_t n = ARGS.n_elems;
+    uint32_t n = STATS.n_elems;
 
     uint32_t sort_start = 0, sort_end = 0;
     if (me() == 0) sort_start = perfcounter_get();
