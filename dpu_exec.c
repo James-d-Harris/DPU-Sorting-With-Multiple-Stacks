@@ -361,7 +361,7 @@ int dpu_run_and_collect(dpu_exec_ctx_t *ctx,
         // ----- Execute -----
         double t0_exec = now_ms();
         for (uint32_t i = begin; i < end; i++) {
-            dpu_error_t e = dpu_launch(ctx->dpus[i], DPU_SYNCHRONOUS);
+            dpu_error_t e = dpu_launch(ctx->dpus[i], DPU_ASYNCHRONOUS);
             if (e != DPU_OK) {
                 fprintf(stderr, "[Set %u, DPU %u] dpu_launch failed: %s\n",
                         s, i, dpu_error_to_string(e));
@@ -397,8 +397,8 @@ int dpu_run_and_collect_parallel_bucketed(
     dpu_exec_ctx_t *ctx,
     uint32_t num_sets,
     uint32_t *bucketed,
-    uint32_t N,
-    const uint32_t *final_offsets,
+    uint64_t N,
+    const uint64_t *final_offsets,
     const uint32_t *final_counts,
     uint32_t num_buckets,
     double *out_ms_h2d,
@@ -435,7 +435,7 @@ int dpu_run_and_collect_parallel_bucketed(
         fprintf(stderr, "[exec] bucketed: OOM spans\n"); return -4;
     }
 
-    // Per-set error flags (so we don’t return from inside OMP loop)
+    // Per-set error flags (so we don't return from inside OMP loop)
     int *set_err = (int *)calloc(num_sets, sizeof(int));
     if (!set_err) { fprintf(stderr, "[exec] bucketed: OOM set_err\n"); return -5; }
 
@@ -478,119 +478,84 @@ int dpu_run_and_collect_parallel_bucketed(
         }
         if (set_err[s]) continue;
 
+        // --- compute max_bytes for this set of used DPUs ---
         const size_t max_bytes = (size_t)max_cnt * sizeof(elem_t);
 
-        // Stage buffers
-        elem_t **h2d_bufs = (elem_t **)calloc(ndpus_used, sizeof(elem_t *));
-        struct dpu_stats *h2d_stats = (struct dpu_stats *)calloc(ndpus_used, sizeof(struct dpu_stats));
-        if (!h2d_bufs || !h2d_stats) {
-            if (h2d_bufs) free(h2d_bufs);
-            if (h2d_stats) free(h2d_stats);
-            fprintf(stderr, "[exec][set %u] OOM staging\n", s);
-            set_err[s] = 1; continue;
-        }
+        // --- allocate per-used-DPU slabs and one shared dummy slab ---
+        elem_t **h2d_bufs = NULL;
+        elem_t *dummy_in  = NULL;
 
-        for (uint32_t j = 0; j < ndpus_used; j++) {
-            uint32_t bidx = set_base + j;
-            uint32_t off  = final_offsets[bidx];
-            uint32_t cnt  = final_counts[bidx];
+        if (ndpus_used > 0 && max_bytes > 0) {
+            h2d_bufs = (elem_t **)calloc(ndpus_used, sizeof(*h2d_bufs));
+            for (uint32_t j = 0; j < ndpus_used; j++) {
+                h2d_bufs[j] = (elem_t *)aligned_alloc(8, max_bytes);           // multiple of 8 OK
+                uint32_t bidx = set_base + j;
+                uint32_t off  = (uint32_t)final_offsets[bidx];
+                uint32_t cnt  = final_counts[bidx];
 
-            if (max_bytes > 0) {
-                h2d_bufs[j] = (elem_t *)aligned_alloc(8, max_bytes);
-                if (!h2d_bufs[j]) {
-                    fprintf(stderr, "[exec][set %u] OOM: h2d_bufs[%u]\n", s, j);
-                    for (uint32_t t = 0; t < j; t++) free(h2d_bufs[t]);
-                    free(h2d_bufs); free(h2d_stats);
-                    h2d_bufs = NULL; h2d_stats = NULL;
-                    set_err[s] = 1; break;
-                }
-                // pack
+                // pack + pad to max_cnt
                 uint32_t k = 0;
-                for (; k < cnt; k++) { h2d_bufs[j][k].v = bucketed[off + k]; h2d_bufs[j][k].pad = 0u; }
-                for (; k < max_cnt; k++) { h2d_bufs[j][k].v = 0u; h2d_bufs[j][k].pad = 0u; }
+                for (; k < cnt; k++) { h2d_bufs[j][k].v = bucketed[off + k]; h2d_bufs[j][k].pad = 0; }
+                for (; k < max_cnt; k++) { h2d_bufs[j][k].v = 0; h2d_bufs[j][k].pad = 0; }
             }
-
-            h2d_stats[j].n_elems      = cnt;
-            h2d_stats[j].nr_tasklets  = NR_TASKLETS;
-            h2d_stats[j].cycles_sort  = 0u;
-            h2d_stats[j].cycles_total = 0u;
-            h2d_stats[j].cycles_start = 0u;
+            dummy_in = (elem_t *)aligned_alloc(8, max_bytes);
+            for (size_t i = 0; i < max_cnt; i++) { dummy_in[i].v = 0; dummy_in[i].pad = 0; }
         }
-        if (set_err[s]) continue;
 
-        // H2D
+        // --- build per-DPU STATS (real for used, zero for unused) ---
+        struct dpu_stats *stats_in = (struct dpu_stats *)calloc(ndpus, sizeof(*stats_in));
+        for (uint32_t j = 0; j < ndpus; j++) {
+            if (j < ndpus_used) {
+                uint32_t bidx = set_base + j;
+                stats_in[j].n_elems     = final_counts[bidx];
+                stats_in[j].nr_tasklets = NR_TASKLETS;
+            } else {
+                // unused DPU in this set -> zeroed stats OK
+            }
+        }
+
         double t0_h2d = now_ms();
 
         #pragma omp critical
         {
-            // Zero STATS on all DPUs in this set
+            // 1) Zero STATS on all DPUs (optional but fine)
             {
-                struct dpu_set_t dpu;
                 struct dpu_stats zero = {0};
-                uint32_t prepared = 0, seen = 0;
-                DPU_FOREACH(ctx->sets[s], dpu) {
-                    DPU_ASSERT(dpu_prepare_xfer(dpu, &zero));
-                    prepared++; seen++;
-                }
-                if (prepared > 0) {
-                    DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU,
-                                            DPU_STATS_SYM, 0,
-                                            sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
-                }
+                struct dpu_set_t dpu;
+                DPU_FOREACH(ctx->sets[s], dpu) { DPU_ASSERT(dpu_prepare_xfer(dpu, &zero)); }
+                DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU, DPU_STATS_SYM, 0,
+                                        sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
             }
 
-            // Input upload for first ndpus_used DPUs (if any data)
-            size_t prepared_inputs = 0;
+            // 2) Upload INPUT to all DPUs in the set (real for first ndpus_used, dummy for the rest)
             if (max_bytes > 0) {
                 struct dpu_set_t dpu; uint32_t j = 0;
                 DPU_FOREACH(ctx->sets[s], dpu) {
-                    if (j >= ndpus_used) break;
-                    DPU_ASSERT(dpu_prepare_xfer(dpu, h2d_bufs[j]));
-                    j++; prepared_inputs++;
+                    if (j < ndpus_used) DPU_ASSERT(dpu_prepare_xfer(dpu, h2d_bufs[j]));
+                    else                DPU_ASSERT(dpu_prepare_xfer(dpu, dummy_in));
+                    j++;
                 }
-                if (prepared_inputs > 0) {
-                    DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU,
-                                            DPU_INPUT_SYM, 0,
-                                            max_bytes, DPU_XFER_DEFAULT));
-                }
-            } else {
-                fprintf(stderr, "[exec][set %u] max_bytes=0 (no data to upload)\n", s);
+                DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU, DPU_INPUT_SYM, 0,
+                                        max_bytes, DPU_XFER_DEFAULT));
             }
 
-            // Overwrite STATS for used DPUs with real counts
+            // 3) Write real STATS to all DPUs (used have counts, unused are zero)
             {
-                struct dpu_set_t dpu; uint32_t j = 0, prepared = 0;
-                DPU_FOREACH(ctx->sets[s], dpu) {
-                    if (j >= ndpus_used) break;
-                    DPU_ASSERT(dpu_prepare_xfer(dpu, &h2d_stats[j]));
-                    j++; prepared++;
-                }
-                fprintf(stderr, "[exec][set %u] prepared_stats=%u (ndpus_used=%u)\n",
-                        s, prepared, ndpus_used);
-                if (prepared > 0) {
-                    DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU,
-                                            DPU_STATS_SYM, 0,
-                                            sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
-                }
-            }
-
-            // Verify by reading back STATS from the first used DPU
-            {
-                if (ndpus_used > 0) {
-                    struct dpu_set_t dpu; uint32_t j = 0; struct dpu_stats check = {0};
-                    DPU_FOREACH(ctx->sets[s], dpu) {
-                        if (j == 0) {
-                            DPU_ASSERT(dpu_copy_from(dpu, DPU_STATS_SYM, 0,
-                                                    &check, sizeof(check)));
-                            break;
-                        }
-                        j++;
-                    }
-                }
+                struct dpu_set_t dpu; uint32_t j = 0;
+                DPU_FOREACH(ctx->sets[s], dpu) { DPU_ASSERT(dpu_prepare_xfer(dpu, &stats_in[j++])); }
+                DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_TO_DPU, DPU_STATS_SYM, 0,
+                                        sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
             }
         }
+
         double t1_h2d = now_ms();
         h2d_start[s] = t0_h2d; h2d_end[s] = t1_h2d;
+
+        // free H2D temps after push
+        if (h2d_bufs) { for (uint32_t j = 0; j < ndpus_used; j++) free(h2d_bufs[j]); free(h2d_bufs); }
+        if (dummy_in) free(dummy_in);
+        free(stats_in);
+
 
 
 
@@ -614,81 +579,72 @@ int dpu_run_and_collect_parallel_bucketed(
         // D2H
         double t0_d2h = now_ms();
 
+        // one slab per used DPU, plus one shared sink for unused
+        elem_t **d2h_bufs = NULL;
+        elem_t *sink      = NULL;
+
+        if (ndpus > 0 && max_bytes > 0) {
+            d2h_bufs = (elem_t **)calloc(ndpus_used, sizeof(*d2h_bufs));
+            for (uint32_t j = 0; j < ndpus_used; j++) {
+                d2h_bufs[j] = (elem_t *)aligned_alloc(8, max_bytes);
+            }
+            sink = (elem_t *)aligned_alloc(8, max_bytes); // discard
+        }
+
         #pragma omp critical
         {
-            fprintf(stderr, "[exec] %u preparing d2h\n", tid);
+            // Pull INPUT from all DPUs in the set (used -> d2h_bufs[j], unused -> sink)
             if (max_bytes > 0) {
-                elem_t **d2h_bufs = (elem_t **)calloc(ndpus_used, sizeof(elem_t *));
-                if (!d2h_bufs) {
-                    fprintf(stderr, "[exec][set %u] OOM: d2h_bufs\n", s);
-                } else {
-                    for (uint32_t j = 0; j < ndpus_used; j++) {
-                        d2h_bufs[j] = (elem_t *)aligned_alloc(8, max_bytes);
-                        if (!d2h_bufs[j]) {
-                            for (uint32_t t = 0; t < j; t++) free(d2h_bufs[t]);
-                            free(d2h_bufs); d2h_bufs = NULL; break;
-                        }
-                    }
-                    if (d2h_bufs) {
-                        struct dpu_set_t dpu; uint32_t j = 0, prepared = 0;
-                        DPU_FOREACH(ctx->sets[s], dpu) {
-                            if (j >= ndpus_used) break;
-                            DPU_ASSERT(dpu_prepare_xfer(dpu, d2h_bufs[j]));
-                            j++; prepared++;
-                        }
-                        if (prepared > 0) {
-                            DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_FROM_DPU, DPU_INPUT_SYM, 0, max_bytes, DPU_XFER_DEFAULT));
-                        }
-                        // write back in-place to bucketed array
-                        for (uint32_t j2 = 0; j2 < ndpus_used; j2++) {
-                            uint32_t bidx = set_base + j2;
-                            uint32_t off  = final_offsets[bidx];
-                            uint32_t cnt  = final_counts[bidx];
-                            for (uint32_t k = 0; k < cnt; k++) {
-                                bucketed[off + k] = d2h_bufs[j2][k].v;
-                            }
-                        }
-                        for (uint32_t j3 = 0; j3 < ndpus_used; j3++) free(d2h_bufs[j3]);
-                        free(d2h_bufs);
-                    }
+                struct dpu_set_t dpu; uint32_t j = 0;
+                DPU_FOREACH(ctx->sets[s], dpu) {
+                    if (j < ndpus_used) DPU_ASSERT(dpu_prepare_xfer(dpu, d2h_bufs[j]));
+                    else                DPU_ASSERT(dpu_prepare_xfer(dpu, sink));
+                    j++;
                 }
+                DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_FROM_DPU, DPU_INPUT_SYM, 0,
+                                        max_bytes, DPU_XFER_DEFAULT));
             }
 
-            // pull STATS
+            // Pull STATS from all DPUs (we’ll use the first ndpus_used)
+            struct dpu_stats *stats_tmp = (struct dpu_stats *)calloc(ndpus, sizeof(*stats_tmp));
             {
-                struct dpu_stats *stats_tmp = (struct dpu_stats *)calloc(ndpus_used, sizeof(*stats_tmp));
-                if (stats_tmp) {
-                    struct dpu_set_t dpu; uint32_t j = 0, prepared = 0;
-                    DPU_FOREACH(ctx->sets[s], dpu) {
-                        if (j >= ndpus_used) break;
-                        DPU_ASSERT(dpu_prepare_xfer(dpu, &stats_tmp[j]));
-                        j++; prepared++;
-                    }
-                    if (prepared > 0) {
-                        DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_FROM_DPU, DPU_STATS_SYM, 0, sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
-                    }
-                    uint64_t min_c = UINT64_MAX, max_c = 0; double sum_c = 0.0;
-                    for (uint32_t j2 = 0; j2 < ndpus_used; j2++) {
-                        uint64_t c = stats_tmp[j2].cycles_sort;
-                        if (c < min_c) min_c = c;
-                        if (c > max_c) max_c = c;
-                        sum_c += (double)c;
-                    }
-                    double avg_c = ndpus_used ? (sum_c / (double)ndpus_used) : 0.0;
-                    printf("[Set %u] cycles_sort min=%" PRIu64 " avg=%.1f max=%" PRIu64 " ; dpus=%u\n",
-                        s, min_c, avg_c, max_c, ndpus_used);
-                    free(stats_tmp);
+                struct dpu_set_t dpu; uint32_t j = 0;
+                DPU_FOREACH(ctx->sets[s], dpu) { DPU_ASSERT(dpu_prepare_xfer(dpu, &stats_tmp[j++])); }
+                DPU_ASSERT(dpu_push_xfer(ctx->sets[s], DPU_XFER_FROM_DPU, DPU_STATS_SYM, 0,
+                                        sizeof(struct dpu_stats), DPU_XFER_DEFAULT));
+            }
+
+            // write back real buckets and summarize cycles
+            if (max_bytes > 0) {
+                for (uint32_t j = 0; j < ndpus_used; j++) {
+                    uint32_t bidx = set_base + j;
+                    uint32_t off  = (uint32_t)final_offsets[bidx];
+                    uint32_t cnt  = final_counts[bidx];
+                    for (uint32_t k = 0; k < cnt; k++) bucketed[off + k] = d2h_bufs[j][k].v;
                 }
             }
 
-            fprintf(stderr, "[exec] %u finished d2h\n", tid);
+            uint64_t min_c = UINT64_MAX, max_c = 0; double sum_c = 0.0;
+            for (uint32_t j = 0; j < ndpus_used; j++) {
+                uint64_t c = stats_tmp[j].cycles_sort;
+                if (c < min_c) min_c = c;
+                if (c > max_c) max_c = c;
+                sum_c += (double)c;
+            }
+            double avg_c = ndpus_used ? (sum_c / (double)ndpus_used) : 0.0;
+            printf("[Set %u] cycles_sort min=%" PRIu64 " avg=%.1f max=%" PRIu64 " ; dpus=%u\n",
+                s, min_c, avg_c, max_c, ndpus_used);
+
+            free(stats_tmp);
         }
 
         double t1_d2h = now_ms();
         d2h_start[s] = t0_d2h; d2h_end[s] = t1_d2h;
 
-        if (h2d_bufs) { for (uint32_t j = 0; j < ndpus_used; j++) free(h2d_bufs[j]); free(h2d_bufs); }
-        if (h2d_stats) free(h2d_stats);
+        // free D2H temps
+        if (d2h_bufs) { for (uint32_t j = 0; j < ndpus_used; j++) free(d2h_bufs[j]); free(d2h_bufs); }
+        if (sink) free(sink);
+
     } // end parallel for
 
     // Aggregate errors

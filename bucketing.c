@@ -1,6 +1,14 @@
+#define _GNU_SOURCE 1
+#define _FILE_OFFSET_BITS 64
 #define _POSIX_C_SOURCE 200809L
 #include "bucketing.h"
 
+#include <fcntl.h>
+#include <stdbool.h>
+#include <sys/mman.h>
+#include <unistd.h> 
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -9,6 +17,10 @@
 #include <inttypes.h>
 #include <math.h>
 #include <omp.h>
+#include <sys/syscall.h>
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
 
 #ifndef NUM_THREADS
 #define NUM_THREADS 8
@@ -20,10 +32,10 @@ static inline double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
-int bucketing_build(const uint32_t *input, uint32_t N,
+int bucketing_build(const uint32_t *input, uint64_t N,
                     uint32_t total_dpus, uint32_t cap,
                     uint32_t **out_bucketed,
-                    uint32_t **out_offsets,
+                    uint64_t **out_offsets,
                     uint32_t **out_counts,
                     uint32_t *out_num_buckets)
 {
@@ -32,7 +44,9 @@ int bucketing_build(const uint32_t *input, uint32_t N,
     if (cap == 0u)
         return -2;
 
+    omp_set_dynamic(0);
     omp_set_num_threads(NUM_THREADS);
+    int T = NUM_THREADS;
 
     // -------- Global min/max (parallel) --------
     uint32_t vmin = UINT32_MAX, vmax = 0;
@@ -40,7 +54,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
     {
         uint32_t lmin = UINT32_MAX, lmax = 0;
         #pragma omp for nowait schedule(static)
-        for (uint32_t i = 0; i < N; i++) {
+        for (uint64_t i = 0; i < N; i++) {
             uint32_t v = input[i];
             if (v < lmin) lmin = v;
             if (v > lmax) lmax = v;
@@ -61,26 +75,25 @@ int bucketing_build(const uint32_t *input, uint32_t N,
     if (B < 1024u) B = 1024u;               // floor for stability
 
     uint32_t *bin_counts = NULL;
-    uint32_t *bin_offsets = NULL;
+    uint64_t *bin_offsets = NULL;
 
     uint32_t *bucketed = NULL;
-    uint32_t *final_offsets = NULL;
+    uint64_t *final_offsets = NULL;
     uint32_t *final_counts  = NULL;
     uint32_t  num_buckets   = 0;
 
-    // Expand B until no bin exceeds "cap".
+    // We'll expand B until no bin exceeds "cap".
     for (int attempt = 0; attempt < 16; attempt++) {
         free(bin_counts);  bin_counts  = NULL;
         free(bin_offsets); bin_offsets = NULL;
 
         bin_counts  = (uint32_t *)calloc((size_t)B, sizeof(uint32_t));
-        bin_offsets = (uint32_t *)malloc((size_t)B * sizeof(uint32_t));
+        bin_offsets = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
         if (!bin_counts || !bin_offsets) { free(bin_counts); free(bin_offsets); return -4; }
 
         long double inv_range = (long double)B / (long double)range;
 
         // Parallel local hist + reduction
-        int T = omp_get_max_threads();
         uint32_t **local_bins = (uint32_t **)malloc((size_t)T * sizeof(uint32_t *));
         if (!local_bins) { free(bin_counts); free(bin_offsets); return -4; }
         uint32_t *lb_store = (uint32_t *)calloc((size_t)T * (size_t)B, sizeof(uint32_t));
@@ -93,7 +106,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
             uint32_t *lb = local_bins[tid];
 
             #pragma omp for schedule(static)
-            for (uint32_t i = 0; i < N; i++) {
+            for (uint64_t i = 0; i < N; i++) {
                 uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
                 uint64_t b   = (uint64_t)(inv_range * (long double)rel);
                 if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
@@ -111,7 +124,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         free(lb_store);
         free(local_bins);
 
-        // cap constraint
+        // Check bin cap
         uint32_t max_bin = 0;
         #pragma omp parallel for reduction(max:max_bin) schedule(static)
         for (uint32_t b = 0; b < B; b++) {
@@ -128,9 +141,12 @@ int bucketing_build(const uint32_t *input, uint32_t N,
             continue;
         }
 
-        // --- prefix
-        uint32_t total = 0;
-        for (uint32_t b = 0; b < B; b++) { bin_offsets[b] = total; total += bin_counts[b]; }
+        // Prefix
+        uint64_t total = 0;
+        for (uint32_t b = 0; b < B; b++) { 
+            bin_offsets[b] = total; 
+            total += (uint64_t)bin_counts[b]; 
+        }
         if (total != N) { free(bin_counts); free(bin_offsets); return -6; }
 
         // Pack
@@ -138,8 +154,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         bucketed = (uint32_t *)malloc((size_t)N * sizeof(uint32_t));
         if (!bucketed) { free(bin_counts); free(bin_offsets); return -7; }
 
-        // rebuild local hist to compute per-thread offsets
-        T = omp_get_max_threads();
+        // Rebuild local hist for per-thread offsets
         uint32_t **local_bins2 = (uint32_t **)malloc((size_t)T * sizeof(uint32_t *));
         if (!local_bins2) { free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
         uint32_t *lb_store2 = (uint32_t *)calloc((size_t)T * (size_t)B, sizeof(uint32_t));
@@ -152,7 +167,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
             uint32_t *lb = local_bins2[tid];
 
             #pragma omp for schedule(static)
-            for (uint32_t i = 0; i < N; i++) {
+            for (uint64_t i = 0; i < N; i++) {
                 uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
                 uint64_t b   = (uint64_t)((long double)B * (long double)rel / (long double)range);
                 if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
@@ -161,15 +176,15 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         }
 
         // per-thread starting offsets per bin
-        uint32_t **thread_prefix = (uint32_t **)malloc((size_t)T * sizeof(uint32_t *));
+        uint64_t **thread_prefix = (uint64_t **)malloc((size_t)T * sizeof(uint64_t *));
         if (!thread_prefix) { free(lb_store2); free(local_bins2); free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
-        uint32_t *tp_store = (uint32_t *)malloc((size_t)T * (size_t)B * sizeof(uint32_t));
+        uint64_t *tp_store = (uint64_t *)malloc((size_t)T * (size_t)B * sizeof(uint64_t));
         if (!tp_store) { free(thread_prefix); free(lb_store2); free(local_bins2); free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
         for (int t = 0; t < T; t++) thread_prefix[t] = tp_store + (size_t)t * (size_t)B;
 
         #pragma omp parallel for schedule(static)
         for (uint32_t b = 0; b < B; b++) {
-            uint32_t run = bin_offsets[b];
+            uint64_t run = bin_offsets[b];
             for (int t = 0; t < T; t++) {
                 thread_prefix[t][b] = run;
                 run += local_bins2[t][b];
@@ -179,17 +194,17 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
-            uint32_t *cursor = (uint32_t *)malloc((size_t)B * sizeof(uint32_t));
-            uint32_t *cur = cursor ? cursor : thread_prefix[tid];
-            memcpy(cur, thread_prefix[tid], (size_t)B * sizeof(uint32_t));
+            uint64_t *cursor = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
+            uint64_t *cur = cursor ? cursor : thread_prefix[tid];
+            memcpy(cur, thread_prefix[tid], (size_t)B * sizeof(uint64_t));
 
             #pragma omp for schedule(static)
-            for (uint32_t i = 0; i < N; i++) {
+            for (uint64_t i = 0; i < N; i++) {
                 uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
                 uint64_t b   = (uint64_t)((long double)B * (long double)rel / (long double)range);
                 if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
-                uint32_t pos = cur[(uint32_t)b]++;
-                bucketed[pos] = input[i];
+                uint64_t pos = cur[(uint32_t)b]++;
+                bucketed[(size_t)pos] = input[i];
             }
             if (cursor) free(cursor);
         }
@@ -208,7 +223,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         uint32_t cap_buckets = (uint32_t)(est_buckets + 8u);
         if (cap_buckets == 0) cap_buckets = 8u;
 
-        final_offsets = (uint32_t *)malloc((size_t)cap_buckets * sizeof(uint32_t));
+        final_offsets = (uint64_t *)malloc((size_t)cap_buckets * sizeof(uint64_t));
         final_counts  = (uint32_t *)malloc((size_t)cap_buckets * sizeof(uint32_t));
         if (!final_offsets || !final_counts) {
             free(final_offsets); free(final_counts);
@@ -218,17 +233,19 @@ int bucketing_build(const uint32_t *input, uint32_t N,
 
         num_buckets = 0;
         uint32_t acc = 0;
-        uint32_t cur_start = (B > 0 ? bin_offsets[0] : 0);
+        uint64_t cur_start = (B > 0 ? bin_offsets[0] : 0);
 
         for (uint32_t b = 0; b < B; b++) {
             uint32_t cnt = bin_counts[b];
             if (acc > 0 && (uint64_t)acc + (uint64_t)cnt > (uint64_t)cap) {
                 if (num_buckets >= cap_buckets) {
                     uint32_t new_cap = cap_buckets * 2u;
-                    uint32_t *no = (uint32_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint32_t));
+                    uint64_t *no = (uint64_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint64_t));
                     uint32_t *nc = (uint32_t *)realloc(final_counts,  (size_t)new_cap * sizeof(uint32_t));
                     if (!no || !nc) { free(no); free(nc); free(final_offsets); free(final_counts); free(bucketed); free(bin_counts); free(bin_offsets); return -10; }
-                    final_offsets = no; final_counts = nc; cap_buckets = new_cap;
+                    final_offsets = no;
+                    final_counts  = nc;
+                    cap_buckets = new_cap;
                 }
                 final_offsets[num_buckets] = cur_start;
                 final_counts[num_buckets]  = acc;
@@ -241,10 +258,12 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         if (acc > 0 || (B == 0 && N == 0)) {
             if (num_buckets >= cap_buckets) {
                 uint32_t new_cap = cap_buckets + 1u;
-                uint32_t *no = (uint32_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint32_t));
+                uint64_t *no = (uint64_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint64_t));
                 uint32_t *nc = (uint32_t *)realloc(final_counts,  (size_t)new_cap * sizeof(uint32_t));
                 if (!no || !nc) { free(no); free(nc); free(final_offsets); free(final_counts); free(bucketed); free(bin_counts); free(bin_offsets); return -11; }
-                final_offsets = no; final_counts = nc; cap_buckets = new_cap;
+                final_offsets = no;
+                final_counts  = nc;
+                cap_buckets   = new_cap;
             }
             final_offsets[num_buckets] = cur_start;
             final_counts[num_buckets]  = acc;
@@ -256,15 +275,15 @@ int bucketing_build(const uint32_t *input, uint32_t N,
         for (uint32_t i = 0; i < num_buckets; i++) {
             if (i == 0) {
                 if (final_offsets[i] != 0u) {
-                    fprintf(stderr, "[bucketing_build] first offset %u != 0\n", final_offsets[i]);
+                    fprintf(stderr, "[bucketing_build] first offset %lu != 0\n", final_offsets[i]);
                     free(final_offsets); free(final_counts);
                     free(bucketed); free(bin_counts); free(bin_offsets);
                     return -12;
                 }
             } else {
-                uint32_t prev_end = final_offsets[i-1] + final_counts[i-1];
+                uint64_t prev_end = final_offsets[i-1] + final_counts[i-1];
                 if (final_offsets[i] != prev_end) {
-                    fprintf(stderr, "[bucketing_build] gap/overlap at i=%u (off=%u, prev_end=%u)\n",
+                    fprintf(stderr, "[bucketing_build] gap/overlap at i=%u (off=%lu, prev_end=%lu)\n",
                             i, final_offsets[i], prev_end);
                     free(final_offsets); free(final_counts);
                     free(bucketed); free(bin_counts); free(bin_offsets);
@@ -274,7 +293,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
             tot += (uint64_t)final_counts[i];
         }
         if (tot != (uint64_t)N) {
-            fprintf(stderr, "[bucketing_build] total=%" PRIu64 " != N=%u\n", tot, N);
+            fprintf(stderr, "[bucketing_build] total=%" PRIu64 " != N=%lu\n", tot, N);
             free(final_offsets); free(final_counts);
             free(bucketed); free(bin_counts); free(bin_offsets);
             return -14;
@@ -291,12 +310,12 @@ int bucketing_build(const uint32_t *input, uint32_t N,
                 free(b_start); free(b_end);
                 free(final_offsets); free(final_counts);
                 free(bucketed); free(bin_counts); free(bin_offsets);
-                return -12;
+                return -16;
             }
 
             for (uint32_t i = 0; i < num_buckets; i++) {
-                uint32_t off = final_offsets[i];
-                uint32_t end = final_offsets[i] + final_counts[i];
+                uint64_t off = final_offsets[i];
+                uint64_t end = final_offsets[i] + (uint64_t)final_counts[i];
 
                 // Find sb such that bin_offsets[sb] == off
                 // (bin_offsets is non-decreasing; equals on non-empty bins)
@@ -313,13 +332,13 @@ int bucketing_build(const uint32_t *input, uint32_t N,
                 // Find eb as the first bin AFTER the last bin used by this bucket
                 for (uint32_t b = sb; b < B; b++) {
                     if (bin_counts[b] == 0) continue;
-                    uint32_t bend = bin_offsets[b] + bin_counts[b];
+                    uint64_t bend = bin_offsets[b] + (uint64_t)bin_counts[b];
                     if (bend == end) { eb = b + 1; found_eb = 1; break; }
                 }
                 if (!found_eb) {
                     // Fallback: advance until we pass 'end'
                     for (uint32_t b = sb; b < B; b++) {
-                        uint32_t bend = bin_offsets[b] + bin_counts[b];
+                        uint64_t bend = bin_offsets[b] + (uint64_t)bin_counts[b];
                         if (bend >= end) { eb = b + 1; found_eb = 1; break; }
                     }
                 }
@@ -383,7 +402,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
             uint32_t max_new = 0;
             for (uint32_t i = 0; i < num_buckets; i++) max_new += (final_counts[i] ? parts[i] : 0u);
 
-            uint32_t *new_offsets = (uint32_t *)malloc((size_t)max_new * sizeof(uint32_t));
+            uint64_t *new_offsets = (uint64_t *)malloc((size_t)max_new * sizeof(uint64_t));
             uint32_t *new_counts  = (uint32_t *)malloc((size_t)max_new * sizeof(uint32_t));
             if (!new_offsets || !new_counts) {
                 free(new_offsets); free(new_counts);
@@ -401,7 +420,8 @@ int bucketing_build(const uint32_t *input, uint32_t N,
                 uint32_t sb = b_start[i], eb = b_end[i];
                 uint32_t remain = final_counts[i];
 
-                uint32_t cur_off = 0, cur_cnt = 0;
+                uint64_t cur_off = 0; 
+                uint32_t cur_cnt = 0;
                 uint32_t piece_target = (remain + p - 1u) / p; // balanced first target
 
                 // Start at first bin of this bucket
@@ -410,7 +430,7 @@ int bucketing_build(const uint32_t *input, uint32_t N,
 
                 for (uint32_t b = sb; b < eb; b++) {
                     if (bin_counts[b] == 0) continue; // skip empty bins inside range
-                    uint32_t boff = bin_offsets[b];
+                    uint64_t boff = bin_offsets[b];
                     uint32_t bcnt = bin_counts[b];
 
                     if (cur_cnt == 0) cur_off = boff;
@@ -433,8 +453,9 @@ int bucketing_build(const uint32_t *input, uint32_t N,
                 }
             }
 
-            free(final_offsets); free(final_counts);
-            final_offsets = new_offsets;
+            free(final_offsets); 
+            free(final_counts);
+            final_offsets = (uint64_t *)new_offsets;
             final_counts  = new_counts;
             num_buckets   = write;
 
@@ -462,12 +483,12 @@ int bucketing_build(const uint32_t *input, uint32_t N,
 
 
 int verify_across_buckets(const uint32_t *bucketed,
-                                 const uint32_t *final_offsets,
+                                 const uint64_t *final_offsets,
                                  const uint32_t *final_counts,
                                  uint32_t num_buckets)
 {
     for (uint32_t i = 0; i < num_buckets; i++) {
-        uint32_t off = final_offsets[i], cnt = final_counts[i];
+        uint64_t off = final_offsets[i], cnt = final_counts[i];
         for (uint32_t k = 1; k < cnt; k++) {
             if (bucketed[off + k - 1] > bucketed[off + k]) {
                 fprintf(stderr, "[VERIFY] Intra-bucket inversion at bucket %u, k=%u: %u > %u\n",
@@ -476,7 +497,7 @@ int verify_across_buckets(const uint32_t *bucketed,
             }
         }
         if (i + 1 < num_buckets) {
-            uint32_t off2 = final_offsets[i + 1], cnt2 = final_counts[i + 1];
+            uint64_t off2 = final_offsets[i + 1], cnt2 = final_counts[i + 1];
             if (cnt && cnt2) {
                 uint32_t last  = bucketed[off + cnt - 1];
                 uint32_t first = bucketed[off2];
@@ -492,64 +513,102 @@ int verify_across_buckets(const uint32_t *bucketed,
 }
 
 int verify_buckets_host_pre(const uint32_t *bucketed,
-                                const uint32_t *off,
-                                const uint32_t *cnt,
-                                uint32_t nb)
+                            const uint64_t *off,
+                            const uint32_t *cnt,
+                            uint32_t nb,
+                            uint64_t N_total)
 {
-    if (nb < 2) {
-        return 0;
+    if (nb < 2 || N_total == 0) return 0;
+
+    // ---- Structural validation (sequential) ----
+    // Check offsets monotonicity and that each bucket fits within N_total.
+    for (uint32_t i = 0; i < nb; i++) {
+        if (i > 0 && off[i] < off[i - 1]) {
+            fprintf(stderr, "[PRE] offsets not nondecreasing at i=%u: %" PRIu64 " < %" PRIu64 "\n",
+                    i, off[i], off[i - 1]);
+            return -2;
+        }
+        __uint128_t end128 = (__uint128_t)off[i] + (__uint128_t)cnt[i];
+        if (end128 > (__uint128_t)N_total) {
+            fprintf(stderr, "[PRE] bucket %u end out of range: off=%" PRIu64 " cnt=%u (end=%" PRIu64 "), N_total=%" PRIu64 "\n",
+                    i, off[i], cnt[i], (uint64_t)end128, N_total);
+            return -2;
+        }
     }
 
+    for (uint32_t i = 0; i + 1 < nb; i++) {
+        if (off[i] + (uint64_t)cnt[i] > off[i + 1]) {
+            fprintf(stderr, "[PRE] bucket %u overlaps next: end=%" PRIu64 " > next off=%" PRIu64 "\n",
+                    i, off[i] + (uint64_t)cnt[i], off[i + 1]);
+            return -2;
+        }
+    }
+
+    // ---- Parallel cross-boundary inversion check ----
     int bad_i = INT_MAX;
     const int n_pairs = (int)nb - 1;
 
     #pragma omp parallel for schedule(static) reduction(min:bad_i)
     for (int i = 0; i < n_pairs; i++) {
-        uint32_t off0 = off[i];
+        uint64_t off0 = off[i];
         uint32_t c0   = cnt[i];
-        uint32_t off1 = off[i + 1];
+        uint64_t off1 = off[i + 1];
         uint32_t c1   = cnt[i + 1];
 
-        if (c0 == 0 || c1 == 0) {
-            continue;
+        if (c0 == 0 || c1 == 0) continue;
+
+        uint64_t end0 = off0 + (uint64_t)c0;
+        uint64_t end1 = off1 + (uint64_t)c1;
+
+        // Defensive caps (structure check already guarantees these)
+        if (end0 > N_total || end1 > N_total) continue;
+
+        uint32_t max0 = 0;
+        for (uint64_t idx = off0; idx < end0; idx++) {
+            uint32_t v = bucketed[(size_t)idx];
+            if (v > max0) max0 = v;
         }
 
-        uint32_t last0  = bucketed[off0 + c0 - 1];
-        uint32_t first1 = bucketed[off1];
-
-        if (last0 > first1) {
-            if (i < bad_i) {
-                bad_i = i;
-            }
+        uint32_t min1 = UINT32_MAX;
+        for (uint64_t idx = off1; idx < end1; idx++) {
+            uint32_t v = bucketed[(size_t)idx];
+            if (v < min1) min1 = v;
         }
+
+        if (max0 > min1 && i < bad_i) bad_i = i;
     }
 
-    if (bad_i == INT_MAX) {
-        return 0;
-    }
+    if (bad_i == INT_MAX) return 0;
 
+    // ---- Detailed repro (clamped, no OOB even with bad metadata) ----
     uint32_t i = (uint32_t)bad_i;
-    uint32_t off0 = off[i];
-    uint32_t c0   = cnt[i];
-    uint32_t off1 = off[i + 1];
-    uint32_t c1   = cnt[i + 1];
+    uint64_t off0 = off[i],     end0 = off0 + (uint64_t)cnt[i];
+    uint64_t off1 = off[i + 1], end1 = off1 + (uint64_t)cnt[i + 1];
 
-    uint32_t last0  = (c0 ? bucketed[off0 + c0 - 1] : 0);
-    uint32_t first1 = (c1 ? bucketed[off1] : 0);
+    if (end0 > N_total) end0 = N_total;
+    if (end1 > N_total) end1 = N_total;
+
+    uint32_t last0  = (off0 < end0) ? bucketed[(size_t)(end0 - 1)] : 0;
+    uint32_t first1 = (off1 < end1) ? bucketed[(size_t)off1]       : 0;
 
     fprintf(stderr,
             "[PRE] Cross-bucket inversion between %u and %u: %u > %u\n",
             i, i + 1, last0, first1);
 
-    uint32_t w0s = (c0 >= 8 ? c0 - 8 : 0);
+    uint64_t len0 = (end0 > off0) ? (end0 - off0) : 0;
+    uint64_t tail = (len0 > 8 ? 8 : len0);
     fprintf(stderr, "     tail of %u:", i);
-    for (uint32_t z = 0; z < (c0 - w0s); z++) {
-        fprintf(stderr, " %u", bucketed[off0 + w0s + z]);
+    for (uint64_t z = 0; z < tail; z++) {
+        uint64_t idx = end0 - tail + z;
+        fprintf(stderr, " %u", bucketed[(size_t)idx]);
     }
 
+    uint64_t len1 = (end1 > off1) ? (end1 - off1) : 0;
+    uint64_t head = (len1 > 8 ? 8 : len1);
     fprintf(stderr, "\n     head of %u:", i + 1);
-    for (uint32_t z = 0; z < (c1 < 8 ? c1 : 8); z++) {
-        fprintf(stderr, " %u", bucketed[off1 + z]);
+    for (uint64_t z = 0; z < head; z++) {
+        uint64_t idx = off1 + z;
+        fprintf(stderr, " %u", bucketed[(size_t)idx]);
     }
     fprintf(stderr, "\n");
 

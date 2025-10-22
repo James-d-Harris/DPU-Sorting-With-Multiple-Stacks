@@ -31,7 +31,7 @@
 #endif
 
 // How many elements to sort per dpu
-#define ELEMS_PER_DPU 800000u
+// #define ELEMS_PER_DPU 800000u
 
 static const char *format_with_commas(uint64_t n) {
     static char buf[32];
@@ -109,19 +109,18 @@ int main(void)
     }
     fprintf(stderr, "[host] dpu_prepare_sets returned %d\n", pret);
 
-    const uint32_t N = nb_dpus * ELEMS_PER_DPU;
+    const uint64_t N = (uint64_t)nb_dpus * (uint64_t)ELEMS_PER_DPU;
 
-    fprintf(stderr, "[host] sorting %u elements\n", N);
+    fprintf(stderr, "[host] sorting %s elements\n", format_with_commas(N));
 
     uint32_t *h_input = (uint32_t *)malloc((size_t)N * sizeof(uint32_t));
     if (!h_input) {
-        fprintf(stderr, "OOM for input N=%" PRIu32 "\n", N);
+        fprintf(stderr, "OOM for input N=%" PRIu64 "\n", N);
         dpu_release(ctx);
         return 1;
     }
 
     // fill input
-
     uint64_t base_seed = (uint64_t)time(NULL);   // use a fixed constant for reproducible runs
     #pragma omp parallel
     {
@@ -129,8 +128,7 @@ int main(void)
         uint64_t state = splitmix64(base_seed ^ (uint64_t)tid);
 
         #pragma omp for schedule(static)
-        for (uint32_t i = 0; i < N; i++) {
-            // one 64-bit draw → use lower 32 bits (or mix with >> 32 if you want)
+        for (uint64_t i = 0; i < N; i++) {
             uint64_t r = xorshift64s(&state);
             h_input[i] = (uint32_t)r;
         }
@@ -150,7 +148,7 @@ int main(void)
 
     // build buckets to match (or <=) available DPUs
     uint32_t *bucketed      = NULL;
-    uint32_t *final_offsets = NULL;
+    uint64_t *final_offsets = NULL;
     uint32_t *final_counts  = NULL;
     uint32_t  num_buckets   = 0;
 
