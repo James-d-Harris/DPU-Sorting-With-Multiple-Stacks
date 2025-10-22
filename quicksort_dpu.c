@@ -1,4 +1,4 @@
-// dpu_quicksort.c
+// dpu_quicksort.c (no vprintf; debug-safe)
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +11,11 @@
 #include <perfcounter.h>
 
 #ifndef NR_TASKLETS
-#define NR_TASKLETS 16
+#define NR_TASKLETS 1
+#endif
+
+#ifndef QS_DEBUG
+#define QS_DEBUG 0     // set to 1 at compile time to see logs
 #endif
 
 // ---------- Per-DPU stats (host pulls this) ----------
@@ -24,6 +28,7 @@ struct dpu_stats {
 };
 __host struct dpu_stats STATS;
 
+// Barrier object is created for any NR_TASKLETS; waits are guarded below.
 BARRIER_INIT(sync_barrier, NR_TASKLETS);
 
 // ---------- Element & MRAM layout ----------
@@ -33,11 +38,46 @@ typedef struct __attribute__((packed, aligned(8))) {
 } elem_t;
 
 #ifndef MAX_ELEMS_PER_DPU
-#define MAX_ELEMS_PER_DPU 16384
+#define MAX_ELEMS_PER_DPU 8192000u
 #endif
 
 __mram_noinit elem_t MRAM_ARR[MAX_ELEMS_PER_DPU];
 
+// ---------- Debug helpers (only tasklet 0 prints) ----------
+#if QS_DEBUG
+  #define DBG_PRINT(...)            \
+    do {                            \
+      if (me() == 0) {              \
+        printf(__VA_ARGS__);        \
+      }                             \
+    } while (0)
+
+static inline void dbg_print_slice(const char *tag, uint32_t n) {
+    if (me() != 0) return;
+    elem_t tmp;
+    uint32_t show = (n < 8u ? n : 8u);
+
+    printf("[DPU] %s: n=%u head(%u):", tag, (unsigned)n, (unsigned)show);
+    for (uint32_t i = 0; i < show; i++) {
+        mram_read(&MRAM_ARR[i], &tmp, sizeof(tmp));
+        printf(" %u", tmp.v);
+    }
+    printf("\n");
+
+    if (n > show) {
+        uint32_t start = (n > 8u ? n - 8u : 0u);
+        uint32_t show_tail = n - start;
+        printf("[DPU] %s: tail(%u):", tag, (unsigned)show_tail);
+        for (uint32_t i = start; i < n; i++) {
+            mram_read(&MRAM_ARR[i], &tmp, sizeof(tmp));
+            printf(" %u", tmp.v);
+        }
+        printf("\n");
+    }
+}
+#else
+  #define DBG_PRINT(...) do {} while (0)
+#endif
 
 // ---------- MRAM helpers (8B aligned) ----------
 static inline void mram_read_elem(uint32_t idx, elem_t *dst) {
@@ -53,7 +93,6 @@ static inline void mram_swap(uint32_t i, uint32_t j, elem_t *tmp_i, elem_t *tmp_
     mram_write_elem(i, tmp_j);
     mram_write_elem(j, tmp_i);
 }
-
 static inline uint32_t read_value(uint32_t idx, elem_t *tmp) {
     mram_read_elem(idx, tmp);
     return tmp->v;
@@ -73,12 +112,21 @@ static void quicksort_mram(uint32_t start, uint32_t count) {
     if (count <= 1) return;
 
     // Depth ~ 2*log2(n)
-    uint32_t lg = 0; for (uint32_t t = count; t > 1; t >>= 1) lg++;
+    uint32_t lg = 0;
+    for (uint32_t t = count; t > 1; t >>= 1) lg++;
     const uint32_t STACK_MAX = (lg << 1) + 8;
     const uint32_t STACK_CAP = (STACK_MAX < 128) ? STACK_MAX : 128;
 
     range_t *stack = (range_t *)mem_alloc(sizeof(range_t) * STACK_CAP);
-    if (!stack) return; // out of WRAM heap, bail
+    if (!stack) {
+#if QS_DEBUG
+        DBG_PRINT("[DPU] mem_alloc failed: need=%u bytes (STACK_CAP=%u, count=%u)\n",
+                  (unsigned)(sizeof(range_t) * STACK_CAP),
+                  (unsigned)STACK_CAP,
+                  (unsigned)count);
+#endif
+        return; // out of WRAM heap, bail
+    }
 
     uint32_t sp = 0;
     elem_t a_buf, b_buf, piv_buf;
@@ -90,29 +138,39 @@ static void quicksort_mram(uint32_t start, uint32_t count) {
         uint32_t lo = rg.lo, hi = rg.hi;
 
         while (lo < hi) {
-            uint32_t mid = lo + ((hi - lo) >> 1);
+            uint32_t mid     = lo + ((hi - lo) >> 1);
             uint32_t piv_idx = median3(lo, mid, hi, &piv_buf);
+
             mram_swap(piv_idx, hi, &a_buf, &b_buf);
             uint32_t pivot = read_value(hi, &piv_buf);
 
             uint32_t i = lo;
             for (uint32_t j = lo; j < hi; j++) {
                 uint32_t vj = read_value(j, &a_buf);
-                if (vj <= pivot) { mram_swap(i, j, &a_buf, &b_buf); i++; }
+                if (vj <= pivot) {
+                    mram_swap(i, j, &a_buf, &b_buf);
+                    i++;
+                }
             }
             mram_swap(i, hi, &a_buf, &b_buf);
 
-            uint32_t left_lo = lo, left_hi = (i == 0) ? 0 : (i - 1);
-            uint32_t right_lo = i + 1, right_hi = hi;
+            uint32_t left_lo  = lo;
+            uint32_t left_hi  = (i == 0) ? 0 : (i - 1);
+            uint32_t right_lo = i + 1;
+            uint32_t right_hi = hi;
 
-            uint32_t left_sz  = (left_hi >= left_lo) ? (left_hi - left_lo + 1) : 0;
-            uint32_t right_sz = (right_hi >= right_lo) ? (right_hi - right_lo + 1) : 0;
+            uint32_t left_sz  = (left_hi >= left_lo)   ? (left_hi - left_lo + 1)  : 0;
+            uint32_t right_sz = (right_hi >= right_lo) ? (right_hi - right_lo + 1): 0;
 
             if (left_sz < right_sz) {
-                if (right_sz > 1 && sp < STACK_CAP) stack[sp++] = (range_t){ right_lo, right_hi };
+                if (right_sz > 1 && sp < STACK_CAP) {
+                    stack[sp++] = (range_t){ right_lo, right_hi };
+                }
                 hi = (left_sz > 0) ? left_hi : left_lo;
             } else {
-                if (left_sz > 1 && sp < STACK_CAP) stack[sp++] = (range_t){ left_lo, left_hi };
+                if (left_sz > 1 && sp < STACK_CAP) {
+                    stack[sp++] = (range_t){ left_lo, left_hi };
+                }
                 lo = right_lo;
             }
         }
@@ -121,21 +179,61 @@ static void quicksort_mram(uint32_t start, uint32_t count) {
 
 // ---------- Tasklet entry ----------
 int main() {
+#if QS_DEBUG
+    DBG_PRINT("[DPU] boot: NR_TASKLETS=%u sizeof(elem_t)=%u MAX_ELEMS_PER_DPU=%u\n",
+              (unsigned)NR_TASKLETS, (unsigned)sizeof(elem_t), (unsigned)MAX_ELEMS_PER_DPU);
+#endif
+
     if (me() == 0) {
         mem_reset();
         perfcounter_config(COUNT_CYCLES, true);
     }
+
+#if NR_TASKLETS > 1
     barrier_wait(&sync_barrier);
+#endif
 
     uint32_t n = STATS.n_elems;
 
+#if QS_DEBUG
+    if (me() == 0) {
+        DBG_PRINT("[DPU] STATS: n=%u tasklets=%u\n",
+                  (unsigned)n, (unsigned)STATS.nr_tasklets);
+        if (n == 0) DBG_PRINT("[DPU] n==0: idle\n");
+        if (n > MAX_ELEMS_PER_DPU) {
+            DBG_PRINT("[DPU][ERR] n (%u) > MAX_ELEMS_PER_DPU (%u)\n",
+                      (unsigned)n, (unsigned)MAX_ELEMS_PER_DPU);
+        }
+    }
+#endif
+
+    // Defensive clamp (prevents OOB if host misconfigures)
+    if (n > MAX_ELEMS_PER_DPU) n = MAX_ELEMS_PER_DPU;
+
+#if QS_DEBUG
+    if (me() == 0 && n > 0) dbg_print_slice("pre", n);
+#endif
+
     uint32_t sort_start = 0, sort_end = 0;
     if (me() == 0) sort_start = perfcounter_get();
-    barrier_wait(&sync_barrier);
 
-    if (n > 1 && me() == 0) quicksort_mram(0, n);
-
+#if NR_TASKLETS > 1
     barrier_wait(&sync_barrier);
+#endif
+
+    if (n > 1 && me() == 0) {
+#if QS_DEBUG
+        DBG_PRINT("[DPU] quicksort start, n=%u\n", (unsigned)n);
+#endif
+        quicksort_mram(0, n);
+#if QS_DEBUG
+        DBG_PRINT("[DPU] quicksort done\n");
+#endif
+    }
+
+#if NR_TASKLETS > 1
+    barrier_wait(&sync_barrier);
+#endif
 
     if (me() == 0) {
         sort_end = perfcounter_get();
@@ -143,8 +241,17 @@ int main() {
         STATS.nr_tasklets  = NR_TASKLETS;
         STATS.cycles_sort  = sort_end - sort_start;
         STATS.cycles_total = perfcounter_get();
+
+#if QS_DEBUG
+        if (n > 0) dbg_print_slice("post", n);
+        DBG_PRINT("[DPU] perf: sort=%u total_now=%u\n",
+                  (unsigned)(sort_end - sort_start),
+                  (unsigned)STATS.cycles_total);
+#endif
     }
 
+#if NR_TASKLETS > 1
     barrier_wait(&sync_barrier);
+#endif
     return 0;
 }

@@ -5,18 +5,19 @@
 #include <inttypes.h>
 #include <time.h>
 #include <string.h>
+#include <omp.h>
 
 #include "bucketing.h"
 #include "dpu_exec.h"
 
-// ---------------- Build-time knobs----------------
+// ---------------- Build-time knobs ----------------
 #ifndef DPU_EXE
 #define DPU_EXE "./quicksort_dpu"
 #endif
 
 // UPDATE IN MAKEFILE
 #ifndef MAX_ELEMS_PER_DPU
-#define MAX_ELEMS_PER_DPU 16384u
+#define MAX_ELEMS_PER_DPU 8192000u
 #endif
 
 // UPDATE IN MAKEFILE
@@ -29,10 +30,53 @@
 #define NUM_SETS 1u
 #endif
 
+// How many elements to sort per dpu
+#define ELEMS_PER_DPU 800000u
+
+static const char *format_with_commas(uint64_t n) {
+    static char buf[32];
+    char tmp[32];
+    snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)n);
+
+    int len = strlen(tmp);
+    int commas = (len - 1) / 3;
+    int out_len = len + commas;
+
+    buf[out_len] = '\0';
+    int j = out_len - 1;
+
+    for (int i = len - 1, count = 0; i >= 0; i--) {
+        buf[j--] = tmp[i];
+        count++;
+        if (count == 3 && i > 0) {
+            buf[j--] = ',';
+            count = 0;
+        }
+    }
+    return buf;
+}
+
 static inline double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static inline uint64_t splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+// xorshift64* generator (fast, decent quality for benchmarking)
+static inline uint64_t xorshift64s(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    return x * 0x2545F4914F6CDD1DULL;
 }
 
 int main(void)
@@ -43,7 +87,6 @@ int main(void)
 
     fprintf(stderr, "[host] entered main\n");
 
-    double t0_total = now_ms();
     fprintf(stderr, "[host] after now_ms; preparing DPUs...\n");
 
 
@@ -66,7 +109,7 @@ int main(void)
     }
     fprintf(stderr, "[host] dpu_prepare_sets returned %d\n", pret);
 
-    const uint32_t N = nb_dpus * 16000;
+    const uint32_t N = nb_dpus * ELEMS_PER_DPU;
 
     fprintf(stderr, "[host] sorting %u elements\n", N);
 
@@ -78,12 +121,23 @@ int main(void)
     }
 
     // fill input
-    double t_gen0 = now_ms();
-    for (uint32_t i = 0; i < N; i++) {
-        uint32_t x = i * 2654435761u;
-        h_input[i] = (x ^ (x >> 16)) + 12345u;
+
+    uint64_t base_seed = (uint64_t)time(NULL);   // use a fixed constant for reproducible runs
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        uint64_t state = splitmix64(base_seed ^ (uint64_t)tid);
+
+        #pragma omp for schedule(static)
+        for (uint32_t i = 0; i < N; i++) {
+            // one 64-bit draw → use lower 32 bits (or mix with >> 32 if you want)
+            uint64_t r = xorshift64s(&state);
+            h_input[i] = (uint32_t)r;
+        }
     }
-    double t_gen1 = now_ms();
+
+
+    double t0_total = now_ms();
 
     // how many DPUs total (opaque getter — no direct field access)
     uint32_t total_dpus = 0;
@@ -100,6 +154,7 @@ int main(void)
     uint32_t *final_counts  = NULL;
     uint32_t  num_buckets   = 0;
 
+    printf("Starting bucketing\n");
     double t_bkt0 = now_ms();
     int bret2 = bucketing_build(
         h_input, N, total_dpus, MAX_ELEMS_PER_DPU,
@@ -107,6 +162,7 @@ int main(void)
     );
     double t_bkt1 = now_ms();
     double ms_bucket = t_bkt1 - t_bkt0;
+    printf("Done bucketing\n");
 
     if (bret2 != 0) {
         fprintf(stderr, "bucketing_build failed (%d)\n", bret2);
@@ -123,6 +179,7 @@ int main(void)
     // run DPUs with deterministic mapping (bucket i -> global DPU position i)
     double ms_h2d = 0.0, ms_exec = 0.0, ms_d2h = 0.0;
 
+    printf("Starting dpu runs\n");
     int rret = dpu_run_and_collect_parallel_bucketed(
         ctx,
         NUM_SETS,
@@ -140,16 +197,17 @@ int main(void)
         return 3;
     }
 
-    // --- timings printout (keep your format)
+    printf("\nNumber of Elements: %s", format_with_commas(N));
+
+    // --- timings printout
     printf("\n--- Host Timings (ms) ---\n");
-    printf("Input generation:     %.3f ms\n", t_gen1 - t_gen0);
-    printf("DPU alloc (ranks):    %.3f ms\n", ms_alloc);
-    // printf("DPU load (program):   %.3f ms\n", ms_load); // Consistent and negligable time
-    printf("Bucketing/packing:    %.3f ms\n", ms_bucket);
-    printf("Host→DPU span:        %.3f ms\n", ms_h2d);
-    printf("Execute span:         %.3f ms\n", ms_exec);
-    printf("DPU→Host span:        %.3f ms\n", ms_d2h);
-    printf("TOTAL wall time:      %.3f ms\n", now_ms() - t0_total);
+    printf("DPU alloc (ranks):    %s ms\n", format_with_commas((uint64_t)ms_alloc));
+    printf("Bucketing/packing:    %s ms\n", format_with_commas((uint64_t)ms_bucket));
+    printf("Host→DPU span:        %s ms\n", format_with_commas((uint64_t)ms_h2d));
+    printf("Execute span:         %s ms\n", format_with_commas((uint64_t)ms_exec));
+    printf("DPU→Host span:        %s ms\n", format_with_commas((uint64_t)ms_d2h));
+    printf("TOTAL wall time:      %s ms\n", format_with_commas((uint64_t)(now_ms() - t0_total)));
+
 
 
     // verification in key order (buckets are in global key order)

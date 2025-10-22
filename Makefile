@@ -9,7 +9,7 @@ stack_size = 256
 
 NUM_SETS = 8
 TOTAL_RANKS = 40
-MAX_ELEMS_PER_DPU = 16384
+MAX_ELEMS_PER_DPU = 16777216
 NUM_THREADS = 8
 
 objs = host_main.o bucketing.o dpu_exec.o

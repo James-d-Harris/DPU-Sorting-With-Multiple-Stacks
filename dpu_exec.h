@@ -25,11 +25,11 @@ int dpu_prepare_sets(uint32_t total_ranks,
 int dpu_run_and_collect_parallel_bucketed(
     dpu_exec_ctx_t *ctx,
     uint32_t num_sets,
-    uint32_t *bucketed,           // mutable: we write sorted buckets back in-place
-    uint32_t N,                   // total elems (sanity only)
+    uint32_t *bucketed,
+    uint32_t N,
     const uint32_t *final_offsets,
     const uint32_t *final_counts,
-    uint32_t num_buckets,         // can be <= total DPUs; extra DPUs idle
+    uint32_t num_buckets,
     double *out_ms_h2d,
     double *out_ms_exec,
     double *out_ms_d2h);
