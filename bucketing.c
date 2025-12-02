@@ -39,213 +39,161 @@ int bucketing_build(const uint32_t *input, uint64_t N,
                     uint32_t **out_counts,
                     uint32_t *out_num_buckets)
 {
-    if (!input || !out_bucketed || !out_offsets || !out_counts || !out_num_buckets)
-        return -1;
-    if (cap == 0u)
-        return -2;
+    if (!input || !out_bucketed || !out_offsets || !out_counts || !out_num_buckets || cap == 0u) return -1;
 
     omp_set_dynamic(0);
     omp_set_num_threads(NUM_THREADS);
-    int T = NUM_THREADS;
+    const int T = NUM_THREADS;
+    const size_t CACHELINE = 64;
 
-    // -------- Global min/max (parallel) --------
+    // --- min/max ---
     uint32_t vmin = UINT32_MAX, vmax = 0;
     #pragma omp parallel
     {
         uint32_t lmin = UINT32_MAX, lmax = 0;
-        #pragma omp for nowait schedule(static)
+        #pragma omp for schedule(static)
         for (uint64_t i = 0; i < N; i++) {
             uint32_t v = input[i];
             if (v < lmin) lmin = v;
             if (v > lmax) lmax = v;
         }
         #pragma omp critical
-        {
-            if (lmin < vmin) vmin = lmin;
-            if (lmax > vmax) vmax = lmax;
-        }
+        { if (lmin < vmin) vmin = lmin; if (lmax > vmax) vmax = lmax; }
     }
-
     uint64_t range = (uint64_t)vmax - (uint64_t)vmin + 1ull;
     if (range == 0ull) range = 1ull;
 
-    // Start with a reasonable B; refine until max_bin <= cap.
-    uint32_t B = 1u << 12;                  // 4096 to start
-    if (B > N) B = (N > 0 ? N : 1u);        // never more bins than elements
-    if (B < 1024u) B = 1024u;               // floor for stability
+    // --- choose bins ---
+    uint32_t B = 1u << 12;
+    if (B > N) B = (uint32_t)(N ? N : 1u);
+    if (B < 1024u) B = 1024u;
 
-    uint32_t *bin_counts = NULL;
-    uint64_t *bin_offsets = NULL;
-
-    uint32_t *bucketed = NULL;
+    // outputs
+    uint32_t *bucketed = (uint32_t *)malloc((size_t)N * sizeof(uint32_t));
     uint64_t *final_offsets = NULL;
     uint32_t *final_counts  = NULL;
     uint32_t  num_buckets   = 0;
 
-    // We'll expand B until no bin exceeds "cap".
+    // reusable work buffers (resized as B grows)
+    uint32_t *bin_counts  = NULL;
+    uint64_t *bin_offsets = NULL;
+
+    // per-thread hist rows, cacheline padded
+    typedef struct { uint32_t c; uint32_t pad; } c32;
+    c32 **local_bins = NULL;
+    c32  *lb_store   = NULL;
+
     for (int attempt = 0; attempt < 16; attempt++) {
-        free(bin_counts);  bin_counts  = NULL;
-        free(bin_offsets); bin_offsets = NULL;
+        // (re)alloc sized by current B
+        bin_counts  = (uint32_t *)realloc(bin_counts,  (size_t)B * sizeof(uint32_t));
+        bin_offsets = (uint64_t *)realloc(bin_offsets, (size_t)B * sizeof(uint64_t));
+        memset(bin_counts, 0, (size_t)B * sizeof(uint32_t));
 
-        bin_counts  = (uint32_t *)calloc((size_t)B, sizeof(uint32_t));
-        bin_offsets = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
-        if (!bin_counts || !bin_offsets) { free(bin_counts); free(bin_offsets); return -4; }
+        // per-thread hist layout
+        size_t row_bytes = ((B * sizeof(c32) + (CACHELINE-1)) / CACHELINE) * CACHELINE;
+        lb_store  = (c32 *)realloc(lb_store,  (size_t)T * row_bytes);
+        memset(lb_store, 0, (size_t)T * row_bytes);
+        local_bins = (c32 **)realloc(local_bins, (size_t)T * sizeof(c32 *));
+        for (int t = 0; t < T; t++) local_bins[t] = (c32 *)((uint8_t*)lb_store + (size_t)t * row_bytes);
 
-        long double inv_range = (long double)B / (long double)range;
+        // fixed-point scale: b = ((rel * scale) >> 32)
+        const uint64_t scale = (((uint64_t)B) << 32) / range;
 
-        // Parallel local hist + reduction
-        uint32_t **local_bins = (uint32_t **)malloc((size_t)T * sizeof(uint32_t *));
-        if (!local_bins) { free(bin_counts); free(bin_offsets); return -4; }
-        uint32_t *lb_store = (uint32_t *)calloc((size_t)T * (size_t)B, sizeof(uint32_t));
-        if (!lb_store) { free(local_bins); free(bin_counts); free(bin_offsets); return -4; }
-        for (int t = 0; t < T; t++) local_bins[t] = lb_store + (size_t)t * (size_t)B;
-
+        // parallel histogram
         #pragma omp parallel
         {
-            int tid = omp_get_thread_num();
-            uint32_t *lb = local_bins[tid];
+            const int tid = omp_get_thread_num();
+            c32 *lb = local_bins[tid];
+            const uint64_t chunk = (N + (uint64_t)T - 1u) / (uint64_t)T;
+            uint64_t beg = (uint64_t)tid * chunk;
+            uint64_t end = beg + chunk; if (end > N) end = N;
 
-            #pragma omp for schedule(static)
-            for (uint64_t i = 0; i < N; i++) {
+            for (uint64_t i = beg; i < end; i++) {
                 uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
-                uint64_t b   = (uint64_t)(inv_range * (long double)rel);
+                uint64_t b   = (rel * scale) >> 32;
                 if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
-                lb[(uint32_t)b] += 1u;
+                lb[b].c += 1u;
             }
         }
 
+        // reduce to bin_counts
         #pragma omp parallel for schedule(static)
         for (uint32_t b = 0; b < B; b++) {
-            uint64_t s = 0;
-            for (int t = 0; t < T; t++) s += local_bins[t][b];
-            bin_counts[b] = (uint32_t)s;
+            uint32_t s = 0;
+            for (int t = 0; t < T; t++) s += local_bins[t][b].c;
+            bin_counts[b] = s;
         }
 
-        free(lb_store);
-        free(local_bins);
-
-        // Check bin cap
+        // cap check
         uint32_t max_bin = 0;
         #pragma omp parallel for reduction(max:max_bin) schedule(static)
-        for (uint32_t b = 0; b < B; b++) {
-            if (bin_counts[b] > max_bin) max_bin = bin_counts[b];
-        }
+        for (uint32_t b = 0; b < B; b++) if (bin_counts[b] > max_bin) max_bin = bin_counts[b];
 
         if (max_bin > cap) {
-            // Need finer bins. Double B, but don't exceed N too much.
             uint64_t newB = (uint64_t)B << 1;
-            if (newB > (uint64_t)N) newB = (uint64_t)N ? (uint64_t)N : (uint64_t)B + 1u;
+            if (newB > (uint64_t)N) newB = (uint64_t)(N ? N : B + 1u);
             if (newB == B) newB = B + (B >> 1);
-            if (newB == B) break; // cannot refine further
+            if (newB == B) break;
             B = (uint32_t)newB;
             continue;
         }
 
-        // Prefix
-        uint64_t total = 0;
-        for (uint32_t b = 0; b < B; b++) { 
-            bin_offsets[b] = total; 
-            total += (uint64_t)bin_counts[b]; 
-        }
-        if (total != N) { free(bin_counts); free(bin_offsets); return -6; }
+        // prefix over bins
+        uint64_t run = 0;
+        for (uint32_t b = 0; b < B; b++) { bin_offsets[b] = run; run += bin_counts[b]; }
 
-        // Pack
-        free(bucketed); bucketed = NULL;
-        bucketed = (uint32_t *)malloc((size_t)N * sizeof(uint32_t));
-        if (!bucketed) { free(bin_counts); free(bin_offsets); return -7; }
-
-        // Rebuild local hist for per-thread offsets
-        uint32_t **local_bins2 = (uint32_t **)malloc((size_t)T * sizeof(uint32_t *));
-        if (!local_bins2) { free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
-        uint32_t *lb_store2 = (uint32_t *)calloc((size_t)T * (size_t)B, sizeof(uint32_t));
-        if (!lb_store2) { free(local_bins2); free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
-        for (int t = 0; t < T; t++) local_bins2[t] = lb_store2 + (size_t)t * (size_t)B;
-
-        #pragma omp parallel
-        {
-            int tid = omp_get_thread_num();
-            uint32_t *lb = local_bins2[tid];
-
-            #pragma omp for schedule(static)
-            for (uint64_t i = 0; i < N; i++) {
-                uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
-                uint64_t b   = (uint64_t)((long double)B * (long double)rel / (long double)range);
-                if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
-                lb[(uint32_t)b] += 1u;
-            }
-        }
-
-        // per-thread starting offsets per bin
-        uint64_t **thread_prefix = (uint64_t **)malloc((size_t)T * sizeof(uint64_t *));
-        if (!thread_prefix) { free(lb_store2); free(local_bins2); free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
-        uint64_t *tp_store = (uint64_t *)malloc((size_t)T * (size_t)B * sizeof(uint64_t));
-        if (!tp_store) { free(thread_prefix); free(lb_store2); free(local_bins2); free(bucketed); free(bin_counts); free(bin_offsets); return -8; }
-        for (int t = 0; t < T; t++) thread_prefix[t] = tp_store + (size_t)t * (size_t)B;
-
+        // per-thread starts: thread_prefix[t*B + b] = bin_offsets[b] + sum_{u<t} local_bins[u][b]
+        uint64_t *thread_prefix = (uint64_t *)malloc((size_t)T * (size_t)B * sizeof(uint64_t));
         #pragma omp parallel for schedule(static)
         for (uint32_t b = 0; b < B; b++) {
-            uint64_t run = bin_offsets[b];
+            uint64_t acc = bin_offsets[b];
             for (int t = 0; t < T; t++) {
-                thread_prefix[t][b] = run;
-                run += local_bins2[t][b];
+                thread_prefix[(size_t)t * B + b] = acc;
+                acc += (uint64_t)local_bins[t][b].c;
             }
         }
 
+        // scatter
         #pragma omp parallel
         {
-            int tid = omp_get_thread_num();
-            uint64_t *cursor = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
-            uint64_t *cur = cursor ? cursor : thread_prefix[tid];
-            memcpy(cur, thread_prefix[tid], (size_t)B * sizeof(uint64_t));
+            const int tid = omp_get_thread_num();
+            const uint64_t chunk = (N + (uint64_t)T - 1u) / (uint64_t)T;
+            uint64_t beg = (uint64_t)tid * chunk;
+            uint64_t end = beg + chunk; if (end > N) end = N;
 
-            #pragma omp for schedule(static)
-            for (uint64_t i = 0; i < N; i++) {
+            uint64_t *cur = (uint64_t *)malloc((size_t)B * sizeof(uint64_t));
+            uint64_t *base = &thread_prefix[(size_t)tid * B];
+            if (cur) memcpy(cur, base, (size_t)B * sizeof(uint64_t)); else cur = base;
+
+            const uint64_t scale2 = scale; // keep in register
+            for (uint64_t i = beg; i < end; i++) {
                 uint64_t rel = (uint64_t)input[i] - (uint64_t)vmin;
-                uint64_t b   = (uint64_t)((long double)B * (long double)rel / (long double)range);
+                uint64_t b   = (rel * scale2) >> 32;
                 if (b >= (uint64_t)B) b = (uint64_t)B - 1ull;
-                uint64_t pos = cur[(uint32_t)b]++;
-                bucketed[(size_t)pos] = input[i];
+                uint64_t pos = cur[b]++;
+                bucketed[pos] = input[i];
             }
-            if (cursor) free(cursor);
+            if (cur != base) free(cur);
         }
-
-        free(tp_store);
         free(thread_prefix);
-        free(lb_store2);
-        free(local_bins2);
 
-        // --- Group bins into buckets (≤ cap). Keep grouping until all N placed.
-        free(final_offsets); final_offsets = NULL;
-        free(final_counts);  final_counts  = NULL;
-
-        // Initial guess for number of buckets: ceil(N / cap) (+ small headroom)
-        uint64_t est_buckets = (cap ? ((uint64_t)N + cap - 1) / cap : 1);
+        // bins -> buckets (≤ cap), coalescing contiguous bins
+        uint64_t est_buckets = cap ? ((N + cap - 1) / cap) : 1;
         uint32_t cap_buckets = (uint32_t)(est_buckets + 8u);
-        if (cap_buckets == 0) cap_buckets = 8u;
-
         final_offsets = (uint64_t *)malloc((size_t)cap_buckets * sizeof(uint64_t));
         final_counts  = (uint32_t *)malloc((size_t)cap_buckets * sizeof(uint32_t));
-        if (!final_offsets || !final_counts) {
-            free(final_offsets); free(final_counts);
-            free(bucketed); free(bin_counts); free(bin_offsets);
-            return -9;
-        }
 
         num_buckets = 0;
         uint32_t acc = 0;
-        uint64_t cur_start = (B > 0 ? bin_offsets[0] : 0);
+        uint64_t cur_start = (B ? bin_offsets[0] : 0);
 
         for (uint32_t b = 0; b < B; b++) {
             uint32_t cnt = bin_counts[b];
-            if (acc > 0 && (uint64_t)acc + (uint64_t)cnt > (uint64_t)cap) {
+            if (acc && (uint64_t)acc + (uint64_t)cnt > (uint64_t)cap) {
                 if (num_buckets >= cap_buckets) {
-                    uint32_t new_cap = cap_buckets * 2u;
-                    uint64_t *no = (uint64_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint64_t));
-                    uint32_t *nc = (uint32_t *)realloc(final_counts,  (size_t)new_cap * sizeof(uint32_t));
-                    if (!no || !nc) { free(no); free(nc); free(final_offsets); free(final_counts); free(bucketed); free(bin_counts); free(bin_offsets); return -10; }
-                    final_offsets = no;
-                    final_counts  = nc;
-                    cap_buckets = new_cap;
+                    cap_buckets *= 2u;
+                    final_offsets = (uint64_t *)realloc(final_offsets, (size_t)cap_buckets * sizeof(uint64_t));
+                    final_counts  = (uint32_t *)realloc(final_counts,  (size_t)cap_buckets * sizeof(uint32_t));
                 }
                 final_offsets[num_buckets] = cur_start;
                 final_counts[num_buckets]  = acc;
@@ -255,230 +203,134 @@ int bucketing_build(const uint32_t *input, uint64_t N,
             }
             acc += cnt;
         }
-        if (acc > 0 || (B == 0 && N == 0)) {
+        if (acc) {
             if (num_buckets >= cap_buckets) {
-                uint32_t new_cap = cap_buckets + 1u;
-                uint64_t *no = (uint64_t *)realloc(final_offsets, (size_t)new_cap * sizeof(uint64_t));
-                uint32_t *nc = (uint32_t *)realloc(final_counts,  (size_t)new_cap * sizeof(uint32_t));
-                if (!no || !nc) { free(no); free(nc); free(final_offsets); free(final_counts); free(bucketed); free(bin_counts); free(bin_offsets); return -11; }
-                final_offsets = no;
-                final_counts  = nc;
-                cap_buckets   = new_cap;
+                cap_buckets += 1u;
+                final_offsets = (uint64_t *)realloc(final_offsets, (size_t)cap_buckets * sizeof(uint64_t));
+                final_counts  = (uint32_t *)realloc(final_counts,  (size_t)cap_buckets * sizeof(uint32_t));
             }
             final_offsets[num_buckets] = cur_start;
             final_counts[num_buckets]  = acc;
             num_buckets++;
         }
 
-        // Sanity: partition coverage
-        uint64_t tot = 0;
-        for (uint32_t i = 0; i < num_buckets; i++) {
-            if (i == 0) {
-                if (final_offsets[i] != 0u) {
-                    fprintf(stderr, "[bucketing_build] first offset %lu != 0\n", final_offsets[i]);
-                    free(final_offsets); free(final_counts);
-                    free(bucketed); free(bin_counts); free(bin_offsets);
-                    return -12;
-                }
-            } else {
-                uint64_t prev_end = final_offsets[i-1] + final_counts[i-1];
-                if (final_offsets[i] != prev_end) {
-                    fprintf(stderr, "[bucketing_build] gap/overlap at i=%u (off=%lu, prev_end=%lu)\n",
-                            i, final_offsets[i], prev_end);
-                    free(final_offsets); free(final_counts);
-                    free(bucketed); free(bin_counts); free(bin_offsets);
-                    return -13;
-                }
-            }
-            tot += (uint64_t)final_counts[i];
-        }
-        if (tot != (uint64_t)N) {
-            fprintf(stderr, "[bucketing_build] total=%" PRIu64 " != N=%lu\n", tot, N);
-            free(final_offsets); free(final_counts);
-            free(bucketed); free(bin_counts); free(bin_offsets);
-            return -14;
-        }
+        /* Ensure num_buckets % total_dpus == 0 by splitting ONLY at bin boundaries.
+        If not enough boundaries are available, we fall back to increasing B and asking
+        the caller to redo (return -2). You can instead loop outside and rerun once with bigger B.
+        */
+        if (total_dpus > 0 && num_buckets > 0) {
+            uint32_t m = total_dpus;
+            uint32_t rem = num_buckets % m;
+            if (rem != 0) {
+                uint32_t need = ((num_buckets + m - 1u) / m) * m - num_buckets;  // extra buckets required
 
-        /* ------------ ensure at least total_dpus buckets (BIN-BOUNDARY SPLITS) ------------ */
-        if (total_dpus > 0 && num_buckets < total_dpus && N > 0) {
-            const uint32_t target = total_dpus;
+                // Map each bucket to its covering bin range [sb, eb) (bin-aligned buckets already have sb..eb contiguous)
+                uint32_t *b_start = (uint32_t *)malloc((size_t)num_buckets * sizeof(uint32_t));
+                uint32_t *b_end   = (uint32_t *)malloc((size_t)num_buckets * sizeof(uint32_t));
 
-            // Map each existing bucket [off, off+cnt) to the contiguous bin range [sb, eb)
-            uint32_t *b_start = (uint32_t *)malloc((size_t)num_buckets * sizeof(uint32_t));
-            uint32_t *b_end   = (uint32_t *)malloc((size_t)num_buckets * sizeof(uint32_t));
-            if (!b_start || !b_end) {
+                // linear scan bins to locate ranges
+                uint32_t bi = 0;
+                for (uint32_t i = 0; i < num_buckets; i++) {
+                    uint64_t off = final_offsets[i];
+                    uint64_t end = off + (uint64_t)final_counts[i];
+
+                    while (bi + 1 < B && bin_offsets[bi + 1] <= off) bi++;
+                    uint32_t sb = bi;
+                    while (bi < B && bin_offsets[bi] + (uint64_t)bin_counts[bi] < end) bi++;
+                    uint32_t eb = (bi < B) ? (bi + 1) : B; // exclusive
+
+                    b_start[i] = sb;
+                    b_end[i]   = eb;
+                }
+
+                // How many *bin-boundary* splits are possible? (each multi-bin bucket with k bins yields up to k-1 splits)
+                uint32_t avail_splits = 0;
+                for (uint32_t i = 0; i < num_buckets; i++) {
+                    uint32_t nbins = (b_end[i] > b_start[i]) ? (b_end[i] - b_start[i]) : 0u;
+                    if (nbins > 1u) avail_splits += (nbins - 1u);
+                }
+
+                if (need > avail_splits) {
+                    // Not enough bin boundaries to reach exact divisibility without in-bin cuts.
+                    // Signal the caller to rerun with larger B (e.g., double B).
+                    free(b_start); free(b_end);
+                    free(final_offsets); free(final_counts);
+                    free(bucketed);
+                    free(bin_counts); free(bin_offsets);
+                    free(local_bins); free(lb_store);
+                    return -2; // REDO with bigger B (e.g., set B*=2 before re-entering)
+                }
+
+                // We can reach the target using ONLY bin boundaries.
+                // Emit new bucket arrays by splitting some multi-bin buckets at internal bin boundaries.
+                uint32_t target_nb = num_buckets + need;
+                uint64_t *noff = (uint64_t *)malloc((size_t)target_nb * sizeof(uint64_t));
+                uint32_t *ncnt = (uint32_t *)malloc((size_t)target_nb * sizeof(uint32_t));
+
+                uint32_t w = 0;
+                uint32_t need_left = need;
+
+                for (uint32_t i = 0; i < num_buckets; i++) {
+                    uint64_t off = final_offsets[i];
+                    uint64_t end = off + (uint64_t)final_counts[i];
+                    uint32_t sb = b_start[i], eb = b_end[i];
+                    uint32_t nbins = (eb > sb) ? (eb - sb) : 0u;
+
+                    if (need_left == 0 || nbins <= 1u) {
+                        // keep as-is
+                        noff[w] = off; ncnt[w] = final_counts[i]; w++;
+                        continue;
+                    }
+
+                    // We may split this bucket at up to (nbins-1) inner bin boundaries, but no more than need_left.
+                    // Walk bins inside [sb, eb) and cut after some of them until need_left is 0.
+                    uint64_t piece_off = off;
+                    uint32_t piece_cnt = 0;
+
+                    for (uint32_t bb = sb; bb < eb; bb++) {
+                        uint64_t boff = bin_offsets[bb];
+                        uint32_t bcnt = bin_counts[bb];
+                        if (bcnt == 0) continue;
+
+                        if (piece_cnt == 0) piece_off = boff;
+                        piece_cnt += bcnt;
+
+                        // We can cut at this bin boundary (i.e., after this bin) if we still need more buckets
+                        if (bb + 1 < eb && need_left > 0) {
+                            noff[w] = piece_off; ncnt[w] = piece_cnt; w++;
+                            need_left--;
+                            piece_cnt = 0; // start next piece at next bin
+                        }
+                    }
+                    // Emit the tail piece
+                    if (piece_cnt > 0) { noff[w] = piece_off; ncnt[w] = piece_cnt; w++; }
+                }
+
+                // Swap in adjusted arrays (order preserved, boundaries only at bin limits)
+                free(final_offsets); free(final_counts);
+                final_offsets = noff; final_counts = ncnt; num_buckets = w;
+
                 free(b_start); free(b_end);
-                free(final_offsets); free(final_counts);
-                free(bucketed); free(bin_counts); free(bin_offsets);
-                return -16;
+                // Now: num_buckets % total_dpus == 0
             }
-
-            for (uint32_t i = 0; i < num_buckets; i++) {
-                uint64_t off = final_offsets[i];
-                uint64_t end = final_offsets[i] + (uint64_t)final_counts[i];
-
-                // Find sb such that bin_offsets[sb] == off
-                // (bin_offsets is non-decreasing; equals on non-empty bins)
-                uint32_t sb = 0, eb = 0;
-                int found_sb = 0, found_eb = 0;
-
-                for (uint32_t b = 0; b < B; b++) {
-                    if (bin_counts[b] && bin_offsets[b] == off) { sb = b; found_sb = 1; break; }
-                }
-                if (!found_sb) {
-                    // Fallback (shouldn't happen): locate the first bin whose offset >= off
-                    for (uint32_t b = 0; b < B; b++) { if (bin_offsets[b] >= off) { sb = b; found_sb = 1; break; } }
-                }
-                // Find eb as the first bin AFTER the last bin used by this bucket
-                for (uint32_t b = sb; b < B; b++) {
-                    if (bin_counts[b] == 0) continue;
-                    uint64_t bend = bin_offsets[b] + (uint64_t)bin_counts[b];
-                    if (bend == end) { eb = b + 1; found_eb = 1; break; }
-                }
-                if (!found_eb) {
-                    // Fallback: advance until we pass 'end'
-                    for (uint32_t b = sb; b < B; b++) {
-                        uint64_t bend = bin_offsets[b] + (uint64_t)bin_counts[b];
-                        if (bend >= end) { eb = b + 1; found_eb = 1; break; }
-                    }
-                }
-                b_start[i] = sb;
-                b_end[i]   = eb; // exclusive
-            }
-
-            // Decide desired parts per bucket, proportional to size, but ≤ number of bins in that bucket.
-            uint32_t *parts = (uint32_t *)malloc((size_t)num_buckets * sizeof(uint32_t));
-            long double *rem = (long double *)malloc((size_t)num_buckets * sizeof(long double));
-            if (!parts || !rem) {
-                free(parts); free(rem); free(b_start); free(b_end);
-                free(final_offsets); free(final_counts);
-                free(bucketed); free(bin_counts); free(bin_offsets);
-                return -16;
-            }
-
-            uint32_t base_sum = 0;
-            for (uint32_t i = 0; i < num_buckets; i++) {
-                uint32_t cnt   = final_counts[i];
-                uint32_t nbins = (b_end[i] > b_start[i] ? (b_end[i] - b_start[i]) : 0);
-                long double exact = ((long double)cnt * (long double)target) / (long double)N;
-                uint32_t p = (uint32_t)floorl(exact);
-                if (p == 0u && cnt > 0) p = 1u;
-                if (p > nbins) p = nbins;           // cannot split more than bin count
-                parts[i] = p;
-                rem[i]   = exact - (long double)p;
-                base_sum += p;
-            }
-
-            // Adjust to match 'target' if possible.
-            if (base_sum < target) {
-                uint32_t deficit = target - base_sum;
-                for (uint32_t k = 0; k < deficit; k++) {
-                    int best = -1; long double best_rem = -1.0L;
-                    for (uint32_t i = 0; i < num_buckets; i++) {
-                        uint32_t nbins = (b_end[i] > b_start[i] ? (b_end[i] - b_start[i]) : 0);
-                        if (final_counts[i] == 0 || parts[i] >= nbins) continue;
-                        if (rem[i] > best_rem) { best_rem = rem[i]; best = (int)i; }
-                    }
-                    if (best < 0) break; // no more bin-boundary splits available
-                    parts[best] += 1u;
-                    rem[best] = 0.0L;
-                    base_sum += 1u;
-                    if (base_sum == target) break;
-                }
-            } else if (base_sum > target) {
-                uint32_t surplus = base_sum - target;
-                for (uint32_t k = 0; k < surplus; k++) {
-                    int best = -1; long double best_rem = 10.0L;
-                    for (uint32_t i = 0; i < num_buckets; i++) {
-                        if (final_counts[i] == 0) continue;
-                        if (parts[i] > 1u && rem[i] < best_rem) { best_rem = rem[i]; best = (int)i; }
-                    }
-                    if (best < 0) break;
-                    parts[best] -= 1u;
-                }
-            }
-
-            // Build refined buckets by assigning WHOLE BINS to each part, load-balancing by remaining.
-            uint32_t max_new = 0;
-            for (uint32_t i = 0; i < num_buckets; i++) max_new += (final_counts[i] ? parts[i] : 0u);
-
-            uint64_t *new_offsets = (uint64_t *)malloc((size_t)max_new * sizeof(uint64_t));
-            uint32_t *new_counts  = (uint32_t *)malloc((size_t)max_new * sizeof(uint32_t));
-            if (!new_offsets || !new_counts) {
-                free(new_offsets); free(new_counts);
-                free(parts); free(rem); free(b_start); free(b_end);
-                free(final_offsets); free(final_counts);
-                free(bucketed); free(bin_counts); free(bin_offsets);
-                return -17;
-            }
-
-            uint32_t write = 0;
-            for (uint32_t i = 0; i < num_buckets; i++) {
-                uint32_t p = parts[i];
-                if (p == 0u || final_counts[i] == 0) continue;
-
-                uint32_t sb = b_start[i], eb = b_end[i];
-                uint32_t remain = final_counts[i];
-
-                uint64_t cur_off = 0; 
-                uint32_t cur_cnt = 0;
-                uint32_t piece_target = (remain + p - 1u) / p; // balanced first target
-
-                // Start at first bin of this bucket
-                if (sb < B) cur_off = bin_offsets[sb];
-                cur_cnt = 0;
-
-                for (uint32_t b = sb; b < eb; b++) {
-                    if (bin_counts[b] == 0) continue; // skip empty bins inside range
-                    uint64_t boff = bin_offsets[b];
-                    uint32_t bcnt = bin_counts[b];
-
-                    if (cur_cnt == 0) cur_off = boff;
-                    cur_cnt += bcnt;
-                    remain -= bcnt;
-
-                    // Close piece if we met target or we're at the last used bin
-                    if (cur_cnt >= piece_target || b + 1 == eb) {
-                        new_offsets[write] = cur_off;
-                        new_counts[write]  = cur_cnt;
-                        write++;
-
-                        p--;
-                        if (p == 0u) break;
-
-                        cur_cnt = 0;
-                        if (b + 1 < eb) cur_off = bin_offsets[b + 1];
-                        piece_target = (remain + p - 1u) / p;
-                    }
-                }
-            }
-
-            free(final_offsets); 
-            free(final_counts);
-            final_offsets = (uint64_t *)new_offsets;
-            final_counts  = new_counts;
-            num_buckets   = write;
-
-            free(parts); free(rem); free(b_start); free(b_end);
         }
-        /* ------------ END (bin-boundary) ------------- */
 
 
-        // Hand off
+        // handoff
         *out_bucketed    = bucketed;
         *out_offsets     = final_offsets;
         *out_counts      = final_counts;
         *out_num_buckets = num_buckets;
 
-        free(bin_counts);
-        free(bin_offsets);
+        free(bin_counts); free(bin_offsets);
+        free(local_bins); free(lb_store);
         return 0;
     }
 
-    // If we fall through attempts without success
     free(bin_counts); free(bin_offsets);
-    fprintf(stderr, "[bucketing_build] Could not make all bins ≤ cap after refinements\n");
-    return -15;
+    free(local_bins); free(lb_store);
+    free(bucketed);
+    return -1;
 }
 
 

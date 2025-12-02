@@ -171,7 +171,7 @@ int main(void)
 
     // // Verifies the buckets were set up properly
     // // Unneeded sanity check
-    // int pre_ok = verify_buckets_host_pre(bucketed, final_offsets, final_counts, num_buckets);
+    // int pre_ok = verify_buckets_host_pre(bucketed, final_offsets, final_counts, num_buckets, N);
     // printf("[Pre] host bucket order: %s\n", pre_ok == 0 ? "OK" : "FAILED");
 
     // run DPUs with deterministic mapping (bucket i -> global DPU position i)
@@ -181,11 +181,11 @@ int main(void)
     int rret = dpu_run_and_collect_parallel_bucketed(
         ctx,
         NUM_SETS,
-        bucketed,         // DPU writes back sorted buckets in place
+        bucketed,
         N,
         final_offsets,
         final_counts,
-        num_buckets,      // can be <= total_dpus (extras idle)
+        num_buckets,
         &ms_h2d, &ms_exec, &ms_d2h
     );
     if (rret != 0) {

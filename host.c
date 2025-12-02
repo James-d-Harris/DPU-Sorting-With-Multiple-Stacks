@@ -26,7 +26,7 @@
 // Number of independent stacks to drive in parallel.
 // Must divide TOTAL_RANKS exactly.
 #ifndef NUM_SETS
-#define NUM_SETS 8
+#define NUM_SETS 1
 #endif
 
 #ifndef TOTAL_RANKS
@@ -171,11 +171,6 @@ static void heap_sift_down(struct heap_node *heap, uint32_t heap_size, uint32_t 
     }
 }
 
-/**
- * Merge nb_runs sorted subarrays from base_ptr into a single sorted array in place.
- * Each run i has [starts[i], starts[i] + counts[i]) relative to base_ptr.
- * Returns 0 on success, -1 on OOM.
- */
 static int merge_sorted_runs(uint32_t *base_ptr, uint32_t N_set, const uint32_t *starts, const uint32_t *counts, uint32_t nb_runs) {
     if (N_set <= 1u) {
         return 0;
@@ -259,10 +254,6 @@ static int merge_sorted_runs(uint32_t *base_ptr, uint32_t N_set, const uint32_t 
     free(tmp);
     return 0;
 }
-
-
-
-
 
 // ---------- Sanity helpers ----------
 static inline int is_sorted_u32(const uint32_t *a, uint32_t n) {
